@@ -426,9 +426,8 @@ io.on("connection", (socket) => {
     console.log(`🔑 Registered: ${key.slice(0,12)}... -> ${socket.id}`);
 
     socket.emit('registered', { status: 'ok' });
-    
-    
-    
+
+
   // --- Notify subscribers that this user is now online (with status hint) ---
     const subscribers = presenceSubscriptions[key]; // key is the pubKeyB64
     if (subscribers && subscribers.length) {
@@ -464,9 +463,8 @@ io.on("connection", (socket) => {
             // --- END MODIFIED ---
         });
     }
-  
-  
-  
+  }); // <<< --- THIS is the correct end for the 'register' handler
+
   // Handle presence subscription
   socket.on("subscribe-to-presence", async (contactPubKeys) => { // <<< Added async
     console.log(`📡 Presence subscription from ${socket.id} for ${contactPubKeys.length} contacts.`);
@@ -494,7 +492,6 @@ io.on("connection", (socket) => {
       presenceSubscriptions[key].push(socket.id);
     });
 
-    // --- 3. Reply with the initial online status of the subscribed contacts ---
     // --- 3. Reply with the initial online status AND status hint of the subscribed contacts ---
     const initialStatusData = [];
     // Create promises to check status for all potentially online contacts
@@ -524,7 +521,7 @@ io.on("connection", (socket) => {
     log(`   Sending initial presence for ${initialStatusData.length} online contacts (with status hints).`);
     socket.emit("presence-initial-status", initialStatusData); // Send the array of objects
     // --- END MODIFIED ---
-  });
+  }); // <-- End of 'subscribe-to-presence' handler
 
   // Handle direct connection requests
   socket.on("request-connection", async ({ to, from }) => {
@@ -542,12 +539,11 @@ io.on("connection", (socket) => {
       io.to(targetSocketId).emit("incoming-request", { from: fromKey });
       console.log(`📨 Connection request (online): ${fromKey.slice(0, 12)}... → ${toKey.slice(0, 12)}...`);
     } else {
-      // --- NEW LOGIC for OFFLINE users with Sleep Mode ---
-     // (Inside the else block for offline users in socket.on("request-connection", ...))
+      // --- Logic for OFFLINE users ---
       console.log(`- User ${toKey.slice(0, 12)}... is offline. No push notification configured/sent.`);
-// All the 'storage.getItem', 'if (subscription)', and 'webpush' code is removed.
+      // (Push notification code removed as per previous step)
     }
-  });
+  }); // <-- End of 'request-connection' handler
 
   // Handle connection acceptance
   socket.on("accept-connection", ({ to, from }) => {
@@ -558,75 +554,69 @@ io.on("connection", (socket) => {
     } else {
       console.log(`⚠️ Could not deliver acceptance to ${to.slice(0,12)} (not registered/online)`);
     }
-  });
+  }); // <-- End of 'accept-connection' handler
 
-  // server.js - New Code
-// -- Video/Voice Call Signaling --
-socket.on("call-request", ({ to, from, callType }) => {
+  // -- Video/Voice Call Signaling --
+  socket.on("call-request", ({ to, from, callType }) => {
     const targetId = userSockets[normKey(to)];
     if (targetId) {
         io.to(targetId).emit("incoming-call", { from: normKey(from), callType });
         console.log(`📞 Call request (${callType}): ${from.slice(0,12)}... → ${to.slice(0,12)}...`);
     }
-});
+  }); // <-- End of 'call-request' handler
 
-socket.on("call-accepted", ({ to, from }) => {
+  socket.on("call-accepted", ({ to, from }) => {
     const targetId = userSockets[normKey(to)];
     if (targetId) {
         io.to(targetId).emit("call-accepted", { from: normKey(from) });
         console.log(`✔️ Call accepted: ${from.slice(0,12)}... → ${to.slice(0,12)}...`);
     }
-});
+  }); // <-- End of 'call-accepted' handler
 
-socket.on("call-rejected", ({ to, from }) => {
+  socket.on("call-rejected", ({ to, from }) => {
     const targetId = userSockets[normKey(to)];
     if (targetId) {
         io.to(targetId).emit("call-rejected", { from: normKey(from) });
         console.log(`❌ Call rejected: ${from.slice(0,12)}... → ${to.slice(0,12)}...`);
     }
-});
+  }); // <-- End of 'call-rejected' handler
 
-socket.on("call-ended", ({ to, from }) => {
+  socket.on("call-ended", ({ to, from }) => {
     const targetId = userSockets[normKey(to)];
     if (targetId) {
         io.to(targetId).emit("call-ended", { from: normKey(from) });
         console.log(`👋 Call ended: ${from.slice(0,12)}... & ${to.slice(0,12)}...`);
     }
-});
-// ---------------------------------
+  }); // <-- End of 'call-ended' handler
+  // ---------------------------------
 
-
-  // Room and signaling logic remains the same
+  // Room joining logic
   socket.on("join", (room) => {
     socket.join(room);
     console.log(`Client ${socket.id} joined ${room}`);
-  });
+  }); // <-- End of 'join' handler
 
-  // Inside server.js
-socket.on("auth", ({ room, payload }) => {
-  // Log exactly what's received
-  console.log(`[SERVER] Received auth for room ${room} from ${socket.id}. Kind: ${payload?.kind}`); // Added log
-  try {
-    // Log before attempting to emit
-    console.log(`[SERVER] Relaying auth (Kind: ${payload?.kind}) to room ${room}...`); // Added log
-    // Use io.to(room) to send to everyone in the room including potentially the sender if needed,
-    // or socket.to(room) to send to everyone *except* the sender.
-    // For auth handshake, io.to(room) or socket.to(room).emit should both work if both clients joined. Let's stick with socket.to for now.
-    socket.to(room).emit("auth", { room, payload });
-    console.log(`[SERVER] Successfully emitted auth to room ${room}.`); // Added log
-  } catch (error) {
-    console.error(`[SERVER] Error emitting auth to room ${room}:`, error); // Added error log
-  }
-});
+  // Auth message relay
+  socket.on("auth", ({ room, payload }) => {
+    console.log(`[SERVER] Received auth for room ${room} from ${socket.id}. Kind: ${payload?.kind}`);
+    try {
+      console.log(`[SERVER] Relaying auth (Kind: ${payload?.kind}) to room ${room}...`);
+      socket.to(room).emit("auth", { room, payload });
+      console.log(`[SERVER] Successfully emitted auth to room ${room}.`);
+    } catch (error) {
+      console.error(`[SERVER] Error emitting auth to room ${room}:`, error);
+    }
+  }); // <-- End of 'auth' handler
 
-// ALSO add logging for the 'signal' handler for WebRTC messages:
-socket.on("signal", ({ room, payload }) => {
-  console.log(`[SERVER] Received signal for room ${room} from ${socket.id}.`); // Added log
-  console.log(`[SERVER] Relaying signal to room ${room}...`); // Added log
-  socket.to(room).emit("signal", { room, payload }); // Assuming payload includes 'from' etc needed by client
-  console.log(`[SERVER] Successfully emitted signal to room ${room}.`); // Added log
-});
+  // WebRTC signal message relay
+  socket.on("signal", ({ room, payload }) => {
+    console.log(`[SERVER] Received signal for room ${room} from ${socket.id}.`);
+    console.log(`[SERVER] Relaying signal to room ${room}...`);
+    socket.to(room).emit("signal", { room, payload });
+    console.log(`[SERVER] Successfully emitted signal to room ${room}.`);
+  }); // <-- End of 'signal' handler
 
+  // Disconnect handling
   socket.on("disconnect", () => {
     console.log("Client disconnected:", socket.id);
     const pubKey = socket.data.pubKey;
@@ -637,6 +627,7 @@ socket.on("signal", ({ room, payload }) => {
       if (subscribers && subscribers.length) {
         console.log(`📢 Notifying ${subscribers.length} subscribers that ${pubKey.slice(0,12)}... is offline.`);
         subscribers.forEach(subscriberSocketId => {
+          // Send offline status (no need to check hasStatus here)
           io.to(subscriberSocketId).emit("presence-update", { pubKey: pubKey, status: "offline" });
         });
       }
@@ -659,8 +650,9 @@ socket.on("signal", ({ room, payload }) => {
       delete userSockets[pubKey];
       console.log(`🗑️ Unregistered and cleaned up subscriptions for: ${pubKey.slice(0, 12)}...`);
     }
-  });
-});
+  }); // <-- End of 'disconnect' handler
+
+}); // <<< --- THIS is the correct end for the main io.on("connection", ...)
 
 const PORT = process.env.PORT || 3000;
 
