@@ -34,13 +34,6 @@ async function connectToMongo() {
 
     // --- TTL Index for Temporary IDs ---
     await idsCollection.createIndex({ "expireAt": 1 }, { expireAfterSeconds: 0 });
-    console.log("   TTL index created for temporary IDs.");
-    
-    // --- NEW: TTL Index for Status Expiration (24 hours) ---
-    // Documents will only expire based on this IF statusTimestamp exists and is a Date
-    await idsCollection.createIndex({ "statusTimestamp": 1 }, { expireAfterSeconds: 86400 }); // 86400 seconds = 24 hours
-    console.log("    TTL index created for statusTimestamp (24h expiry).");
-    // --- END NEW ---
 
     console.log("✅ Connected successfully to MongoDB Atlas");
   } catch (err) {
@@ -72,11 +65,11 @@ app.use(cors());       // CORS Middleware
 // Endpoint to claim a new Syrja ID
 // Endpoint to claim a new Syrja ID (MODIFIED for MongoDB)
 app.post("/claim-id", async (req, res) => {
-    const { customId, fullInviteCode, persistence, privacy, pubKey } = req.body; // Added privacy
+    const { customId, fullInviteCode, persistence, privacy, pubKey, status } = req.body; // Added status
 
     // Added privacy check in condition
-    if (!customId || !fullInviteCode || !persistence || !privacy || !pubKey) {
-        return res.status(400).json({ error: "Missing required fields" });
+    if (!customId || !fullInviteCode || !persistence || !privacy || !pubKey) { // Status is optional, so not strictly required here
+        return res.status(400).json({ error: "Missing required fields (excluding optional status)" });
     }
 
     try {
@@ -94,51 +87,22 @@ app.post("/claim-id", async (req, res) => {
         }
 
         // Prepare the document to insert/update for MongoDB
-        let statusText = null;
-        let statusTimestamp = null;
-        try {
-            // Use Buffer for safer base64 decoding in Node.js
-            const decodedJson = Buffer.from(fullInviteCode, 'base64').toString('utf-8');
-            const inviteData = JSON.parse(decodedJson);
-            if (inviteData && inviteData.statusText && inviteData.statusTimestamp) {
-                if (typeof inviteData.statusText === 'string' && typeof inviteData.statusTimestamp === 'number') {
-                    const now = Date.now();
-                    const twentyFourHoursAgo = now - (24 * 60 * 60 * 1000);
-                    // Check if timestamp is within the last 24 hours + a small buffer for clock skew
-                    if (inviteData.statusTimestamp >= twentyFourHoursAgo && inviteData.statusTimestamp <= now + 60000) {
-                        statusText = inviteData.statusText.slice(0, 500); // Limit status length
-                        statusTimestamp = new Date(inviteData.statusTimestamp); // Store as BSON Date
-                        console.log(`   Status found: "${statusText.substring(0,20)}...", Timestamp: ${statusTimestamp}`);
-                    } else {
-                        console.log(`   Status timestamp invalid: ${new Date(inviteData.statusTimestamp)}. Ignoring status.`);
-                    }
-                }
-            }
-        } catch (e) {
-            console.warn("   Could not parse invite code for status:", e.message);
-        }
-        // --- END NEW ---
-
-        // Prepare the document to insert/update for MongoDB
         const syrjaDoc = {
-            _id: customId,
+            _id: customId, // Use the customId as the MongoDB document ID
             code: fullInviteCode,
             pubKey: pubKey,
             permanent: persistence === 'permanent',
-            privacy: privacy,
-            updatedAt: new Date(),
-            // --- NEW: Add status fields conditionally ---
-            ...(statusText !== null && { statusText: statusText }),
-            ...(statusTimestamp !== null && { statusTimestamp: statusTimestamp })
-            // --- END NEW ---
+            privacy: privacy, // Store privacy settingconsole.log(`✅ ID Claimed/Updated: ${customId} (Permanent: ${syrjaDoc.permanent}, Privacy: ${privacy})`);
+            status: status || null, // Store the received status object or null
+            statusUpdatedAt: status ? new Date() : null, // Add timestamp if status exists
+            updatedAt: new Date() // Track last update time
         };
 
-        // Set expiration for temporary IDs (unchanged logic, just moved position slightly)
+        // Set expiration only for temporary IDs for MongoDB TTL index
         if (persistence === 'temporary') {
-            syrjaDoc.expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+            syrjaDoc.expireAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours from now
         } else {
-            // For permanent IDs, ensure expireAt doesn't exist or is null
-            // $unset below handles removal if it exists
+            syrjaDoc.expireAt = null; // Explicitly set to null for permanent
         }
 
         // Use replaceOne with upsert:true to insert or replace the document
@@ -149,20 +113,12 @@ app.post("/claim-id", async (req, res) => {
         );
 
         // If making permanent, ensure expireAt field is removed using $unset
-        const unsetFields = {};
         if (persistence === 'permanent') {
              await idsCollection.updateOne({ _id: customId }, { $unset: { expireAt: "" } });
         }
-        if (statusText === null) {
-            unsetFields.statusText = "";
-            unsetFields.statusTimestamp = "";
-        }
-        if (Object.keys(unsetFields).length > 0) { // <<< You might need to add this line if it wasn't there
-            await idsCollection.updateOne({ _id: customId }, { $unset: unsetFields });
-        } // <<< You might need to add this line if it wasn't there
 
         // Updated console log
-        console.log(`✅ ID Claimed/Updated: ${customId} (Permanent: ${syrjaDoc.permanent}, Privacy: ${privacy})`);
+        console.log(`✅ ID Claimed/Updated: ${customId} (Permanent: ${syrjaDoc.permanent}, Privacy: ${privacy}, Status: ${!!status})`); // Log if status was presentconsole.log(`✅ ID Claimed/Updated: ${customId} (Permanent: ${syrjaDoc.permanent}, Privacy: ${privacy})`);
         res.json({ success: true, id: customId });
 
     } catch (err) {
@@ -204,7 +160,14 @@ app.get("/get-invite/:id", async (req, res) => {
             // --- END Existing ---
 
             console.log(`➡️ Resolved Syrja ID: ${fullId} (Privacy: ${item.privacy || 'public'}, Not blocked)`);
-            res.json({ fullInviteCode: item.code });
+            const responseData = {
+                fullInviteCode: item.code,
+                // Only include status if it exists and isn't outdated (e.g., > 24 hours?)
+                // For now, let's just include it if it exists. Client can handle expiration.
+                status: item.status || null,
+                statusUpdatedAt: item.statusUpdatedAt || null
+            };
+            res.json(responseData);
         } else {
             console.log(`❓ Failed to resolve Syrja ID (not found or expired): ${fullId}`);
             res.status(404).json({ error: "ID not found or has expired" });
@@ -414,7 +377,7 @@ io.on("connection", (socket) => {
   console.log("Client connected:", socket.id);
 
   // Handle client registration
-  socket.on("register", async (pubKey) => { // <<< Added async
+  socket.on("register", (pubKey) => {
     if (isRateLimited(socket)) {
       console.log(`⚠️ Rate limit exceeded for registration by ${socket.handshake.address}`);
       return;
@@ -426,47 +389,21 @@ io.on("connection", (socket) => {
     console.log(`🔑 Registered: ${key.slice(0,12)}... -> ${socket.id}`);
 
     socket.emit('registered', { status: 'ok' });
-
-
-  // --- Notify subscribers that this user is now online (with status hint) ---
-    const subscribers = presenceSubscriptions[key]; // key is the pubKeyB64
+    
+  // --- Notify subscribers that this user is now online ---
+    const subscribers = presenceSubscriptions[key];
     if (subscribers && subscribers.length) {
-        console.log(`📢 Notifying ${subscribers.length} subscribers that ${key.slice(0,12)}... is online.`);
-
-        // --- NEW: Check for active status ---
-        let hasActiveStatus = false;
-        try {
-            const userDoc = await idsCollection.findOne({ pubKey: key });
-            // Check if timestamp exists, is a Date, and is within the last 24 hours
-            if (userDoc && userDoc.statusTimestamp instanceof Date &&
-                userDoc.statusTimestamp.getTime() >= (Date.now() - 86400000) // 86400000ms = 24 hours
-            ) {
-                hasActiveStatus = true;
-                console.log(`   User ${key.slice(0,12)} has an active status.`);
-            } else if (userDoc && userDoc.statusTimestamp) {
-                 console.log(`   User ${key.slice(0,12)} has an expired status.`);
-            } else {
-                 console.log(`   User ${key.slice(0,12)} has no status set.`);
-            }
-        } catch (dbErr) {
-            console.error(`   Error checking status for ${key.slice(0,12)}:`, dbErr);
-        }
-        // --- END NEW ---
-
-        subscribers.forEach(subscriberSocketId => {
-            // --- MODIFIED: Include hasStatus flag ---
-            io.to(subscriberSocketId).emit("presence-update", {
-                pubKey: key,
-                status: "online",
-                hasStatus: hasActiveStatus // Add the hint here
-            });
-            // --- END MODIFIED ---
-        });
+      console.log(`📢 Notifying ${subscribers.length} subscribers that ${key.slice(0,12)}... is online.`);
+      subscribers.forEach(subscriberSocketId => {
+        io.to(subscriberSocketId).emit("presence-update", { pubKey: key, status: "online" });
+      });
     }
-  }); // <<< --- THIS is the correct end for the 'register' handler
-
+  });
+  
+  
+  
   // Handle presence subscription
-  socket.on("subscribe-to-presence", async (contactPubKeys) => { // <<< Added async
+  socket.on("subscribe-to-presence", (contactPubKeys) => {
     console.log(`📡 Presence subscription from ${socket.id} for ${contactPubKeys.length} contacts.`);
 
     // --- 1. Clean up any previous subscriptions for this socket ---
@@ -492,36 +429,10 @@ io.on("connection", (socket) => {
       presenceSubscriptions[key].push(socket.id);
     });
 
-    // --- 3. Reply with the initial online status AND status hint of the subscribed contacts ---
-    const initialStatusData = [];
-    // Create promises to check status for all potentially online contacts
-    const statusChecks = contactPubKeys.map(async (pubKey) => {
-        const key = normKey(pubKey);
-        const isOnline = !!userSockets[key]; // Check if currently connected
-
-        if (isOnline) {
-            let hasActiveStatus = false;
-            try {
-                const userDoc = await idsCollection.findOne({ pubKey: key });
-                if (userDoc && userDoc.statusTimestamp instanceof Date &&
-                    userDoc.statusTimestamp.getTime() >= (Date.now() - 86400000)
-                ) {
-                    hasActiveStatus = true;
-                }
-            } catch (dbErr) {
-                console.error(`   Initial status check error for ${key.slice(0,12)}:`, dbErr);
-            }
-            initialStatusData.push({ pubKey: key, hasStatus: hasActiveStatus });
-        }
-    });
-
-    // Wait for all database checks to complete
-    await Promise.all(statusChecks);
-
-    log(`   Sending initial presence for ${initialStatusData.length} online contacts (with status hints).`);
-    socket.emit("presence-initial-status", initialStatusData); // Send the array of objects
-    // --- END MODIFIED ---
-  }); // <-- End of 'subscribe-to-presence' handler
+    // --- 3. Reply with the initial online status of the subscribed contacts ---
+    const initialOnlineContacts = contactPubKeys.filter(key => !!userSockets[normKey(key)]);
+    socket.emit("presence-initial-status", initialOnlineContacts);
+  });
 
   // Handle direct connection requests
   socket.on("request-connection", async ({ to, from }) => {
@@ -539,11 +450,12 @@ io.on("connection", (socket) => {
       io.to(targetSocketId).emit("incoming-request", { from: fromKey });
       console.log(`📨 Connection request (online): ${fromKey.slice(0, 12)}... → ${toKey.slice(0, 12)}...`);
     } else {
-      // --- Logic for OFFLINE users ---
+      // --- NEW LOGIC for OFFLINE users with Sleep Mode ---
+     // (Inside the else block for offline users in socket.on("request-connection", ...))
       console.log(`- User ${toKey.slice(0, 12)}... is offline. No push notification configured/sent.`);
-      // (Push notification code removed as per previous step)
+// All the 'storage.getItem', 'if (subscription)', and 'webpush' code is removed.
     }
-  }); // <-- End of 'request-connection' handler
+  });
 
   // Handle connection acceptance
   socket.on("accept-connection", ({ to, from }) => {
@@ -554,69 +466,75 @@ io.on("connection", (socket) => {
     } else {
       console.log(`⚠️ Could not deliver acceptance to ${to.slice(0,12)} (not registered/online)`);
     }
-  }); // <-- End of 'accept-connection' handler
+  });
 
-  // -- Video/Voice Call Signaling --
-  socket.on("call-request", ({ to, from, callType }) => {
+  // server.js - New Code
+// -- Video/Voice Call Signaling --
+socket.on("call-request", ({ to, from, callType }) => {
     const targetId = userSockets[normKey(to)];
     if (targetId) {
         io.to(targetId).emit("incoming-call", { from: normKey(from), callType });
         console.log(`📞 Call request (${callType}): ${from.slice(0,12)}... → ${to.slice(0,12)}...`);
     }
-  }); // <-- End of 'call-request' handler
+});
 
-  socket.on("call-accepted", ({ to, from }) => {
+socket.on("call-accepted", ({ to, from }) => {
     const targetId = userSockets[normKey(to)];
     if (targetId) {
         io.to(targetId).emit("call-accepted", { from: normKey(from) });
         console.log(`✔️ Call accepted: ${from.slice(0,12)}... → ${to.slice(0,12)}...`);
     }
-  }); // <-- End of 'call-accepted' handler
+});
 
-  socket.on("call-rejected", ({ to, from }) => {
+socket.on("call-rejected", ({ to, from }) => {
     const targetId = userSockets[normKey(to)];
     if (targetId) {
         io.to(targetId).emit("call-rejected", { from: normKey(from) });
         console.log(`❌ Call rejected: ${from.slice(0,12)}... → ${to.slice(0,12)}...`);
     }
-  }); // <-- End of 'call-rejected' handler
+});
 
-  socket.on("call-ended", ({ to, from }) => {
+socket.on("call-ended", ({ to, from }) => {
     const targetId = userSockets[normKey(to)];
     if (targetId) {
         io.to(targetId).emit("call-ended", { from: normKey(from) });
         console.log(`👋 Call ended: ${from.slice(0,12)}... & ${to.slice(0,12)}...`);
     }
-  }); // <-- End of 'call-ended' handler
-  // ---------------------------------
+});
+// ---------------------------------
 
-  // Room joining logic
+
+  // Room and signaling logic remains the same
   socket.on("join", (room) => {
     socket.join(room);
     console.log(`Client ${socket.id} joined ${room}`);
-  }); // <-- End of 'join' handler
+  });
 
-  // Auth message relay
-  socket.on("auth", ({ room, payload }) => {
-    console.log(`[SERVER] Received auth for room ${room} from ${socket.id}. Kind: ${payload?.kind}`);
-    try {
-      console.log(`[SERVER] Relaying auth (Kind: ${payload?.kind}) to room ${room}...`);
-      socket.to(room).emit("auth", { room, payload });
-      console.log(`[SERVER] Successfully emitted auth to room ${room}.`);
-    } catch (error) {
-      console.error(`[SERVER] Error emitting auth to room ${room}:`, error);
-    }
-  }); // <-- End of 'auth' handler
+  // Inside server.js
+socket.on("auth", ({ room, payload }) => {
+  // Log exactly what's received
+  console.log(`[SERVER] Received auth for room ${room} from ${socket.id}. Kind: ${payload?.kind}`); // Added log
+  try {
+    // Log before attempting to emit
+    console.log(`[SERVER] Relaying auth (Kind: ${payload?.kind}) to room ${room}...`); // Added log
+    // Use io.to(room) to send to everyone in the room including potentially the sender if needed,
+    // or socket.to(room) to send to everyone *except* the sender.
+    // For auth handshake, io.to(room) or socket.to(room).emit should both work if both clients joined. Let's stick with socket.to for now.
+    socket.to(room).emit("auth", { room, payload });
+    console.log(`[SERVER] Successfully emitted auth to room ${room}.`); // Added log
+  } catch (error) {
+    console.error(`[SERVER] Error emitting auth to room ${room}:`, error); // Added error log
+  }
+});
 
-  // WebRTC signal message relay
-  socket.on("signal", ({ room, payload }) => {
-    console.log(`[SERVER] Received signal for room ${room} from ${socket.id}.`);
-    console.log(`[SERVER] Relaying signal to room ${room}...`);
-    socket.to(room).emit("signal", { room, payload });
-    console.log(`[SERVER] Successfully emitted signal to room ${room}.`);
-  }); // <-- End of 'signal' handler
+// ALSO add logging for the 'signal' handler for WebRTC messages:
+socket.on("signal", ({ room, payload }) => {
+  console.log(`[SERVER] Received signal for room ${room} from ${socket.id}.`); // Added log
+  console.log(`[SERVER] Relaying signal to room ${room}...`); // Added log
+  socket.to(room).emit("signal", { room, payload }); // Assuming payload includes 'from' etc needed by client
+  console.log(`[SERVER] Successfully emitted signal to room ${room}.`); // Added log
+});
 
-  // Disconnect handling
   socket.on("disconnect", () => {
     console.log("Client disconnected:", socket.id);
     const pubKey = socket.data.pubKey;
@@ -627,7 +545,6 @@ io.on("connection", (socket) => {
       if (subscribers && subscribers.length) {
         console.log(`📢 Notifying ${subscribers.length} subscribers that ${pubKey.slice(0,12)}... is offline.`);
         subscribers.forEach(subscriberSocketId => {
-          // Send offline status (no need to check hasStatus here)
           io.to(subscriberSocketId).emit("presence-update", { pubKey: pubKey, status: "offline" });
         });
       }
@@ -650,9 +567,8 @@ io.on("connection", (socket) => {
       delete userSockets[pubKey];
       console.log(`🗑️ Unregistered and cleaned up subscriptions for: ${pubKey.slice(0, 12)}...`);
     }
-  }); // <-- End of 'disconnect' handler
-
-}); // <<< --- THIS is the correct end for the main io.on("connection", ...)
+  });
+});
 
 const PORT = process.env.PORT || 3000;
 
